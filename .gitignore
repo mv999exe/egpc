@@ -1,0 +1,7 @@
+node_modules/
+_*.mjs
+_*.jpg
+_*.avif
+_*.png
+_headers.txt
+*.log

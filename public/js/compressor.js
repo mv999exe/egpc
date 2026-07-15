@@ -1,7 +1,8 @@
 // ============================================================
-// Image Compressor — uses browser-image-compression (vendored).
-// Keeps documents/invoices sharp by preserving resolution and
-// driving size down via WebP quality rather than downscaling.
+// Image Compressor — frontend.
+// Compression happens SERVER-SIDE: we POST the file to /api/compress,
+// where sharp (libvips) re-encodes it to AVIF tuned for documents/text,
+// and we render the returned image in the Before/After slider.
 // ============================================================
 
 (function () {
@@ -27,12 +28,6 @@
   var resultNote = document.getElementById("result-note");
 
   var currentObjectUrls = [];
-
-  // Compression preset — "Smallest size". targetRatio forces the output to be
-  // at most this fraction of the original size (the library shrinks quality and
-  // dimensions to hit it), so every image gets a real reduction. Tune these to
-  // trade size against fidelity.
-  var PRESET = { maxWidthOrHeight: 1600, quality: 0.75, targetRatio: 0.5 };
 
   // ---- Helpers ----------------------------------------------------------
 
@@ -75,17 +70,11 @@
     hide(dropzone);
     hide(resultEl);
     show(statusEl);
-    statusText.textContent = "Compressing…";
+    statusText.textContent = "Compressing on the server…";
 
-    compressBest(file)
-      .then(function (best) {
-        // Never produce a file larger than the original. If even the lowest
-        // quality still isn't smaller (already-optimal input), keep the original.
-        if (best && best.size < file.size) {
-          renderResult(file, best, true);
-        } else {
-          renderResult(file, file, false);
-        }
+    compressOnServer(file)
+      .then(function (out) {
+        renderResult(file, out.blob, out.keptOriginal, out.format, out.mode);
       })
       .catch(function (err) {
         console.error(err);
@@ -95,35 +84,40 @@
       });
   }
 
-  // Force a real, visible size reduction. We give the library a size TARGET
-  // (a fraction of the original) and let it lower quality AND shrink the
-  // dimensions to reach it — so it also shrinks images that are already small
-  // or already below the resolution cap (screenshots, pre-compressed photos),
-  // where quality reduction alone can't beat the original.
-  function compressBest(file) {
-    var sizeMB = file.size / 1024 / 1024;
+  // POST the raw file to the server. The server returns the compressed
+  // image bytes plus size/format metadata in response headers.
+  function compressOnServer(file) {
+    var form = new FormData();
+    form.append("image", file, file.name || "image");
 
-    return imageCompression(file, {
-      maxSizeMB: Math.max(0.02, sizeMB * PRESET.targetRatio),
-      maxWidthOrHeight: PRESET.maxWidthOrHeight,
-      initialQuality: PRESET.quality,
-      useWebWorker: true,
-      fileType: "image/webp",
-    }).then(function (out) {
-      if (out.size < file.size) return out;
-      // Rare: an extremely well-optimized input. Force a harder downscale so
-      // the result is still meaningfully smaller than the original.
-      return imageCompression(file, {
-        maxSizeMB: Math.max(0.015, sizeMB * 0.4),
-        maxWidthOrHeight: 1200,
-        initialQuality: 0.6,
-        useWebWorker: true,
-        fileType: "image/webp",
+    return fetch("/api/compress", { method: "POST", body: form }).then(function (res) {
+      if (!res.ok) {
+        return res
+          .json()
+          .catch(function () {
+            return { error: "Server error " + res.status };
+          })
+          .then(function (j) {
+            throw new Error(j.error || "Server error " + res.status);
+          });
+      }
+      var compressedSize = Number(res.headers.get("X-Compressed-Size")) || 0;
+      var format = res.headers.get("X-Output-Format") || "avif";
+      var keptOriginal = res.headers.get("X-Kept-Original") === "1";
+      var mode = res.headers.get("X-Mode") || "";
+      return res.blob().then(function (blob) {
+        return {
+          blob: blob,
+          size: compressedSize || blob.size,
+          format: format,
+          keptOriginal: keptOriginal,
+          mode: mode,
+        };
       });
     });
   }
 
-  function renderResult(originalFile, resultBlob, compressedUsed) {
+  function renderResult(originalFile, resultBlob, keptOriginal, format, mode) {
     var beforeUrl = trackUrl(URL.createObjectURL(originalFile));
     var afterUrl = trackUrl(URL.createObjectURL(resultBlob));
 
@@ -138,21 +132,30 @@
 
     var beforeSize = originalFile.size;
     var afterSize = resultBlob.size;
-    // Clamp to >= 0: with the smaller-of-two guard this is always non-negative.
     var saved = beforeSize > 0 ? Math.max(0, (1 - afterSize / beforeSize) * 100) : 0;
 
     statBefore.textContent = formatBytes(beforeSize);
     statAfter.textContent = formatBytes(afterSize);
     statSaved.textContent = saved.toFixed(1) + "%";
 
-    if (compressedUsed) {
-      hide(resultNote);
-      downloadBtn.textContent = "Download WebP";
-      var base = (originalFile.name || "image").replace(/\.[^.]+$/, "");
+    var base = (originalFile.name || "image").replace(/\.[^.]+$/, "");
+
+    if (!keptOriginal && format === "avif") {
+      // Show which mode the server picked, so it's clear what happened.
+      if (mode === "document") {
+        resultNote.textContent = "Document mode: converted to grayscale and cleaned up for the sharpest text at the smallest size.";
+        show(resultNote);
+      } else if (mode === "photo") {
+        resultNote.textContent = "Photo mode: kept in full colour (AVIF 4:4:4).";
+        show(resultNote);
+      } else {
+        hide(resultNote);
+      }
+      downloadBtn.textContent = "Download AVIF";
       downloadBtn.href = afterUrl;
-      downloadBtn.download = base + "-compressed.webp";
+      downloadBtn.download = base + "-compressed.avif";
     } else {
-      // Compression would have made the file larger, so we kept the original.
+      // Server determined the input is already optimal and returned it as-is.
       resultNote.textContent =
         "This image is already well optimized — compressing it would make it larger, so the original was kept.";
       show(resultNote);
